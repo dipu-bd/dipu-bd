@@ -1,7 +1,11 @@
 <!-- ### Hi there 👋 -->
 
+<div align="center">
+
 [![overview](https://github.com/dipu-bd/dipu-bd/blob/master/generated/overview.svg)](https://github.com/dipu-bd)
 [![languages](https://github.com/dipu-bd/dipu-bd/blob/master/generated/languages.svg)](https://github.com/dipu-bd?tab=repositories&q=&type=public&language=&sort=stargazers)
+
+</div>
 
 <!--
 **dipu-bd/dipu-bd** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
