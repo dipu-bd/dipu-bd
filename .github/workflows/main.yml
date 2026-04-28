@@ -28,7 +28,8 @@ jobs:
       - name: Generate images
         run: python generate_images.py
         env:
-          ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          GITHUB_USERNAME: ${{ github.repository_owner }}
           EXCLUDED: ${{ secrets.EXCLUDED }}
           EXCLUDED_LANGS: ${{ secrets.EXCLUDED_LANGS }}
           EXCLUDE_FORKED_REPOS: false
