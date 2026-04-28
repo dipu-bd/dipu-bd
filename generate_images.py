@@ -21,6 +21,13 @@ def generate_output_folder() -> None:
         os.mkdir("generated")
 
 
+def log_step(message: str) -> None:
+    """
+    Print a consistent step log line for workflow traces.
+    """
+    print(f"[generate_images] {message}", flush=True)
+
+
 ################################################################################
 # Individual Image Generation Functions
 ################################################################################
@@ -30,9 +37,11 @@ async def generate_overview(s: Stats) -> None:
     Generate an SVG badge with summary statistics
     :param s: Represents user's GitHub statistics
     """
+    log_step("overview: loading template")
     with open("templates/overview.svg", "r") as f:
         output = f.read()
 
+    log_step("overview: collecting stats values")
     output = re.sub("{{ name }}", await s.name, output)
     output = re.sub("{{ stars }}", f"{await s.stargazers:,}", output)
     output = re.sub("{{ forks }}", f"{await s.forks:,}", output)
@@ -43,9 +52,11 @@ async def generate_overview(s: Stats) -> None:
     output = re.sub("{{ views }}", f"{await s.views:,}", output)
     output = re.sub("{{ repos }}", f"{len(await s.repos):,}", output)
 
+    log_step("overview: writing generated/overview.svg")
     generate_output_folder()
     with open("generated/overview.svg", "w") as f:
         f.write(output)
+    log_step("overview: done")
 
 
 async def generate_languages(s: Stats) -> None:
@@ -53,13 +64,16 @@ async def generate_languages(s: Stats) -> None:
     Generate an SVG badge with summary languages used
     :param s: Represents user's GitHub statistics
     """
+    log_step("languages: loading template")
     with open("templates/languages.svg", "r") as f:
         output = f.read()
 
     progress = ""
     lang_list = ""
+    log_step("languages: building language list")
     sorted_languages = sorted((await s.languages).items(), reverse=True,
                               key=lambda t: t[1].get("size"))
+    log_step(f"languages: {len(sorted_languages)} languages found")
     delay_between = 150
     for i, (lang, data) in enumerate(sorted_languages):
         color = data.get("color")
@@ -81,9 +95,11 @@ fill-rule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8z"></path></svg>
     output = re.sub(r"{{ progress }}", progress, output)
     output = re.sub(r"{{ lang_list }}", lang_list, output)
 
+    log_step("languages: writing generated/languages.svg")
     generate_output_folder()
     with open("generated/languages.svg", "w") as f:
         f.write(output)
+    log_step("languages: done")
 
 
 ################################################################################
@@ -94,6 +110,7 @@ async def main() -> None:
     """
     Generate all badges
     """
+    log_step("start")
     access_token = os.getenv("ACCESS_TOKEN")
     if not access_token:
         raise Exception("A personal access token is required to proceed!")
@@ -102,6 +119,7 @@ async def main() -> None:
             or os.getenv("GITHUB_ACTOR"))
     if not user:
         raise Exception("A GitHub username is required to proceed!")
+    log_step(f"using user={user}")
     exclude_repos = os.getenv("EXCLUDED")
     exclude_repos = ({x.strip() for x in exclude_repos.split(",")}
                      if exclude_repos else None)
@@ -112,11 +130,20 @@ async def main() -> None:
     ignore_forked_repos = os.getenv("EXCLUDE_FORKED_REPOS")
     ignore_forked_repos = (not not ignore_forked_repos 
                            and ignore_forked_repos.strip().lower() != "false")
+    log_step(
+        "options: "
+        f"exclude_repos={len(exclude_repos) if exclude_repos else 0}, "
+        f"exclude_langs={len(exclude_langs) if exclude_langs else 0}, "
+        f"ignore_forked_repos={ignore_forked_repos}"
+    )
     async with aiohttp.ClientSession() as session:
+        log_step("creating stats client")
         s = Stats(user, access_token, session, exclude_repos=exclude_repos,
                   exclude_langs=exclude_langs,
                   ignore_forked_repos=ignore_forked_repos)
+        log_step("generating images concurrently")
         await asyncio.gather(generate_languages(s), generate_overview(s))
+    log_step("complete")
 
 if __name__ == "__main__":
     asyncio.run(main())

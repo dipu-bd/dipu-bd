@@ -8,6 +8,13 @@ import aiohttp
 import requests
 
 
+def log_step(message: str) -> None:
+    """
+    Print a consistent step log line for workflow traces.
+    """
+    print(f"[github_stats] {message}", flush=True)
+
+
 ###############################################################################
 # Main Classes
 ###############################################################################
@@ -24,6 +31,11 @@ class Queries(object):
         self.access_token = access_token
         self.session = session
         self.semaphore = asyncio.Semaphore(max_connections)
+        self.max_retries = int(os.getenv("GITHUB_API_MAX_RETRIES", "8"))
+        self.retry_delay_seconds = float(os.getenv("GITHUB_API_RETRY_DELAY", "1"))
+        self.request_timeout = aiohttp.ClientTimeout(
+            total=float(os.getenv("GITHUB_API_TIMEOUT_SECONDS", "20"))
+        )
 
     async def query(self, generated_query: str) -> Dict:
         """
@@ -35,21 +47,26 @@ class Queries(object):
         headers = {
             "Authorization": f"Bearer {self.access_token}",
         }
+        log_step("graphql query: start")
         try:
             async with self.semaphore:
                 r = await self.session.post("https://api.github.com/graphql",
                                             headers=headers,
                                             json={"query": generated_query})
+            log_step(f"graphql query: HTTP {r.status}")
             result = await r.json()
             if result is not None:
+                if "errors" in result:
+                    log_step(f"graphql query: returned {len(result['errors'])} errors")
                 return result
-        except:
-            print("aiohttp failed for GraphQL query")
+        except Exception as exc:
+            log_step(f"graphql query: aiohttp failed ({exc})")
             # Fall back on non-async requests
             async with self.semaphore:
                 r = requests.post("https://api.github.com/graphql",
                                   headers=headers,
                                   json={"query": generated_query})
+                log_step(f"graphql query fallback: HTTP {r.status_code}")
                 result = r.json()
                 if result is not None:
                     return result
@@ -63,7 +80,8 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
-        for _ in range(60):
+        log_step(f"rest query: start path={path}")
+        for attempt in range(self.max_retries):
             headers = {
                 "Authorization": f"token {self.access_token}",
             }
@@ -75,31 +93,46 @@ class Queries(object):
                 async with self.semaphore:
                     r = await self.session.get(f"https://api.github.com/{path}",
                                                headers=headers,
-                                               params=tuple(params.items()))
+                                               params=tuple(params.items()),
+                                               timeout=self.request_timeout)
+                log_step(f"rest query: path={path} attempt={attempt + 1} HTTP {r.status}")
                 if r.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
+                    # GitHub is computing this endpoint; retry with backoff.
+                    delay = self.retry_delay_seconds * (attempt + 1)
+                    log_step(f"{path} returned 202. Retrying in {delay:.1f}s...")
+                    await asyncio.sleep(delay)
                     continue
+                if r.status != 200:
+                    log_step(f"{path} returned HTTP {r.status}. Skipping.")
+                    return dict()
 
                 result = await r.json()
                 if result is not None:
                     return result
-            except:
-                print("aiohttp failed for rest query")
+            except Exception as exc:
+                log_step(f"rest query: aiohttp failed path={path} ({exc})")
                 # Fall back on non-async requests
                 async with self.semaphore:
                     r = requests.get(f"https://api.github.com/{path}",
                                      headers=headers,
-                                     params=tuple(params.items()))
+                                     params=tuple(params.items()),
+                                     timeout=self.request_timeout.total)
+                    log_step(
+                        f"rest query fallback: path={path} "
+                        f"attempt={attempt + 1} HTTP {r.status_code}"
+                    )
                     if r.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
+                        delay = self.retry_delay_seconds * (attempt + 1)
+                        log_step(f"{path} returned 202. Retrying in {delay:.1f}s...")
+                        await asyncio.sleep(delay)
                         continue
                     elif r.status_code == 200:
                         return r.json()
+                    else:
+                        log_step(f"{path} returned HTTP {r.status_code}. Skipping.")
+                        return dict()
         # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
+        log_step("There were too many 202s. Data for this repository will be incomplete.")
         return dict()
 
     @staticmethod
@@ -279,6 +312,7 @@ Languages:
         """
         Get lots of summary statistics using one big query. Sets many attributes
         """
+        log_step("get_stats: start")
         self._stargazers = 0
         self._forks = 0
         self._languages = dict()
@@ -286,7 +320,10 @@ Languages:
 
         next_owned = None
         next_contrib = None
+        page = 0
         while True:
+            page += 1
+            log_step(f"get_stats: fetching page {page}")
             raw_results = await self.queries.query(
                 Queries.repos_overview(owned_cursor=next_owned,
                                        contrib_cursor=next_contrib)
@@ -315,6 +352,7 @@ Languages:
             repos = owned_repos.get("nodes", [])
             if not self._ignore_forked_repos:
                 repos += contrib_repos.get("nodes", [])
+            log_step(f"get_stats: page {page} returned {len(repos)} repos")
 
             for repo in repos:
                 if repo is None:
@@ -329,7 +367,8 @@ Languages:
                 for lang in repo.get("languages", {}).get("edges", []):
                     name = lang.get("node", {}).get("name", "Other")
                     languages = await self.languages
-                    if name in self._exclude_langs: continue
+                    if name in self._exclude_langs:
+                        continue
                     if name in languages:
                         languages[name]["size"] += lang.get("size", 0)
                         languages[name]["occurrences"] += 1
@@ -356,6 +395,11 @@ Languages:
         langs_total = sum([v.get("size", 0) for v in self._languages.values()])
         for k, v in self._languages.items():
             v["prop"] = 100 * (v.get("size", 0) / langs_total)
+        log_step(
+            f"get_stats: done repos={len(self._repos)} "
+            f"stars={self._stargazers} forks={self._forks} "
+            f"languages={len(self._languages)}"
+        )
 
     @property
     async def name(self) -> str:
@@ -432,11 +476,16 @@ Languages:
             return self._total_contributions
 
         self._total_contributions = 0
+        log_step("total_contributions: querying contribution years")
         years = (await self.queries.query(Queries.contrib_years())) \
             .get("data", {}) \
             .get("viewer", {}) \
             .get("contributionsCollection", {}) \
             .get("contributionYears", [])
+        log_step(f"total_contributions: years found={len(years)}")
+        if len(years) == 0:
+            return 0
+        log_step("total_contributions: querying yearly totals")
         by_year = (await self.queries.query(Queries.all_contribs(years))) \
             .get("data", {}) \
             .get("viewer", {}).values()
@@ -444,6 +493,7 @@ Languages:
             self._total_contributions += year \
                 .get("contributionCalendar", {}) \
                 .get("totalContributions", 0)
+        log_step(f"total_contributions: total={self._total_contributions}")
         return self._total_contributions
 
     @property
@@ -453,9 +503,11 @@ Languages:
         """
         if self._lines_changed is not None:
             return self._lines_changed
+        log_step("lines_changed: start")
         additions = 0
         deletions = 0
         for repo in await self.repos:
+            log_step(f"lines_changed: querying repo={repo}")
             r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
             for author_obj in r:
                 # Handle malformed response from the API by skipping this repo
@@ -471,6 +523,7 @@ Languages:
                     deletions += week.get("d", 0)
 
         self._lines_changed = (additions, deletions)
+        log_step(f"lines_changed: additions={additions} deletions={deletions}")
         return self._lines_changed
 
     @property
@@ -482,13 +535,16 @@ Languages:
         if self._views is not None:
             return self._views
 
+        log_step("views: start")
         total = 0
         for repo in await self.repos:
+            log_step(f"views: querying repo={repo}")
             r = await self.queries.query_rest(f"/repos/{repo}/traffic/views")
             for view in r.get("views", []):
                 total += view.get("count", 0)
 
         self._views = total
+        log_step(f"views: total={total}")
         return total
 
 
